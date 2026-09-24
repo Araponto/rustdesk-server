@@ -43,13 +43,13 @@ jobs:
           target: ${{ env.TARGET }}
 
       - name: Test
-        run: cargo test --release --all-features
+        run: cargo test --release --all-features --locked
 
       - name: Build
         uses: actions-rs/cargo@v1
         with:
           command: build
-          args: --release --all-features --target=${{ env.TARGET }}
+          args: --release --all-features --locked --target=${{ env.TARGET }}
           use-cross: true
 
       - name: Checksums

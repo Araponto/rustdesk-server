@@ -1431,9 +1431,11 @@ impl RendezvousServer {
             log::info!("WS register {} from {} rejected: {:?}", id, addr, res);
             return;
         }
-        self.touch_ws_peer(&id, addr).await;
+        // route first, then mark online, so an older connection closing in between cannot
+        // expire this registration
         let (tx, mut rx) = mpsc::unbounded_channel::<Bytes>();
         let conn_id = crate::araponto::ws_peer_add(&id, tx);
+        self.touch_ws_peer(&id, addr).await;
         inc(Stat::WsRegister);
         log::info!("WS register {} from {}", id, addr);
 

@@ -21,7 +21,7 @@ All additions are off by default. With every switch off, hbbs behaves like upstr
 Always on:
 - `X-Real-IP` / `X-Forwarded-For` on the WebSocket ports are trusted only from loopback (the reverse proxy),
   and the proxy-side port is kept, in hbbs and hbbr.
-- `PUNCH_REQS` and `IP_BLOCKER` are bounded in size.
+- `PUNCH_REQS` is bounded in size (10,000 entries).
 - Local console (`127.0.0.1:21115`): `araponto-stats` (`as`) prints the counters, `as -` resets them.
 - Per-controller-and-peer limit on UDP/IPv6 punch requests (8 per 30 s); above it, plain TCP punching.
 
