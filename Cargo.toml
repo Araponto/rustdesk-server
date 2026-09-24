@@ -67,6 +67,9 @@ reqwest = { git = "https://github.com/rustdesk-org/reqwest", features = ["blocki
 
 [build-dependencies]
 hbb_common = { path = "libs/hbb_common" }
+# araponto: build.rs links hbb_common on the host too; inside the cross image the host has no
+# OpenSSL either, so vendor it there as well.
+openssl = { version = "0.10", features = ["vendored"] }
 
 [workspace]
 members = ["libs/hbb_common"]
