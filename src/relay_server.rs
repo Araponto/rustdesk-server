@@ -441,13 +441,8 @@ async fn make_pair(
                 .get("X-Real-IP")
                 .or_else(|| headers.get("X-Forwarded-For"))
                 .and_then(|header_value| header_value.to_str().ok());
-            if let Some(ip) = real_ip {
-                if ip.contains('.') {
-                    addr = format!("{ip}:0").parse().unwrap_or(addr);
-                } else {
-                    addr = format!("[{ip}]:0").parse().unwrap_or(addr);
-                }
-            }
+            // araponto: trust the header only from our reverse proxy on loopback.
+            addr = crate::common::ws_client_addr(addr, real_ip);
             Ok(response)
         };
         let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;

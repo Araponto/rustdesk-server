@@ -400,3 +400,54 @@ mod tests {
             .is_none());
     }
 }
+
+/// araponto: address to use for a WebSocket client. X-Real-IP / X-Forwarded-For are honoured only
+/// when the TCP peer is loopback (our reverse proxy); anyone reaching the port directly keeps its
+/// real address instead of whatever it claims. The port stays the proxy-side one, which is unique
+/// per connection, so two clients behind one NAT never collide. An IPv4 client is written
+/// v4-mapped when the listener is IPv6, the same form UDP clients have.
+#[allow(dead_code)]
+pub(crate) fn ws_client_addr(
+    tcp_peer: std::net::SocketAddr,
+    header: Option<&str>,
+) -> std::net::SocketAddr {
+    use std::net::{IpAddr, SocketAddr};
+    if !hbb_common::try_into_v4(tcp_peer).ip().is_loopback() {
+        return tcp_peer;
+    }
+    let Some(header) = header else {
+        return tcp_peer;
+    };
+    let first = header.split(',').next().unwrap_or_default().trim();
+    let Ok(ip) = first.parse::<IpAddr>() else {
+        return tcp_peer;
+    };
+    let ip = match (tcp_peer, ip) {
+        (SocketAddr::V6(_), IpAddr::V4(v4)) => IpAddr::V6(v4.to_ipv6_mapped()),
+        _ => ip,
+    };
+    SocketAddr::new(ip, tcp_peer.port())
+}
+
+#[cfg(test)]
+mod araponto_tests {
+    use super::ws_client_addr;
+
+    #[test]
+    fn ws_header_trusted_only_from_loopback() {
+        let proxy = "[::ffff:127.0.0.1]:51000".parse().unwrap();
+        let direct = "[::ffff:8.8.8.8]:51000".parse().unwrap();
+        assert_eq!(
+            ws_client_addr(proxy, Some("201.0.179.232")),
+            "[::ffff:201.0.179.232]:51000".parse().unwrap()
+        );
+        assert_eq!(
+            ws_client_addr(proxy, Some("201.0.179.232, 10.0.0.1")),
+            "[::ffff:201.0.179.232]:51000".parse().unwrap()
+        );
+        assert_eq!(ws_client_addr(direct, Some("1.2.3.4")), direct);
+        assert_eq!(ws_client_addr(proxy, Some("garbage")), proxy);
+        assert_eq!(ws_client_addr(proxy, None), proxy);
+    }
+}
+

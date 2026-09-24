@@ -8,7 +8,7 @@ use hbb_common::{
     futures::future::join_all,
     futures_util::{
         sink::SinkExt,
-        stream::{SplitSink, StreamExt},
+        stream::{SplitSink, SplitStream, StreamExt},
     },
     log,
     protobuf::{Message as _, MessageField},
@@ -50,6 +50,7 @@ enum Data {
 const REG_TIMEOUT: i64 = 30_000;
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
+type WsStream = SplitStream<tokio_tungstenite::WebSocketStream<TcpStream>>;
 enum Sink {
     TcpStream(TcpStreamSink),
     Ws(WsSink),
@@ -177,6 +178,7 @@ impl RendezvousServer {
                 "N"
             }
         );
+        crate::araponto::init(rs.pm.clone());
         if test_addr.to_lowercase() != "no" {
             let test_addr = if test_addr.is_empty() {
                 listener.local_addr()?
@@ -369,89 +371,9 @@ impl RendezvousServer {
                     }
                 }
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
-                    if rk.uuid.is_empty() || rk.pk.is_empty() {
-                        return Ok(());
+                    if let Some(res) = self.register_pk_common(rk, addr, false).await {
+                        return send_rk_res(socket, addr, res).await;
                     }
-                    let id = rk.id;
-                    let ip = addr.ip().to_string();
-                    if id.len() < 6 {
-                        return send_rk_res(socket, addr, UUID_MISMATCH).await;
-                    } else if !self.check_ip_blocker(&ip, &id).await {
-                        return send_rk_res(socket, addr, TOO_FREQUENT).await;
-                    }
-                    let peer = self.pm.get_or(&id).await;
-                    let (changed, ip_changed) = {
-                        let peer = peer.read().await;
-                        if peer.uuid.is_empty() {
-                            (true, false)
-                        } else {
-                            if peer.uuid == rk.uuid {
-                                if peer.info.ip != ip && peer.pk != rk.pk {
-                                    log::warn!(
-                                        "Peer {} ip/pk mismatch: {}/{:?} vs {}/{:?}",
-                                        id,
-                                        ip,
-                                        rk.pk,
-                                        peer.info.ip,
-                                        peer.pk,
-                                    );
-                                    drop(peer);
-                                    return send_rk_res(socket, addr, UUID_MISMATCH).await;
-                                }
-                            } else {
-                                log::warn!(
-                                    "Peer {} uuid mismatch: {:?} vs {:?}",
-                                    id,
-                                    rk.uuid,
-                                    peer.uuid
-                                );
-                                drop(peer);
-                                return send_rk_res(socket, addr, UUID_MISMATCH).await;
-                            }
-                            let ip_changed = peer.info.ip != ip;
-                            (
-                                peer.uuid != rk.uuid || peer.pk != rk.pk || ip_changed,
-                                ip_changed,
-                            )
-                        }
-                    };
-                    let mut req_pk = peer.read().await.reg_pk;
-                    if req_pk.1.elapsed().as_secs() > 6 {
-                        req_pk.0 = 0;
-                    } else if req_pk.0 > 2 {
-                        return send_rk_res(socket, addr, TOO_FREQUENT).await;
-                    }
-                    req_pk.0 += 1;
-                    req_pk.1 = Instant::now();
-                    peer.write().await.reg_pk = req_pk;
-                    if ip_changed {
-                        let mut lock = IP_CHANGES.lock().await;
-                        if let Some((tm, ips)) = lock.get_mut(&id) {
-                            if tm.elapsed().as_secs() > IP_CHANGE_DUR {
-                                *tm = Instant::now();
-                                ips.clear();
-                                ips.insert(ip.clone(), 1);
-                            } else if let Some(v) = ips.get_mut(&ip) {
-                                *v += 1;
-                            } else {
-                                ips.insert(ip.clone(), 1);
-                            }
-                        } else {
-                            lock.insert(
-                                id.clone(),
-                                (Instant::now(), HashMap::from([(ip.clone(), 1)])),
-                            );
-                        }
-                    }
-                    if changed {
-                        self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
-                    }
-                    let mut msg_out = RendezvousMessage::new();
-                    msg_out.set_register_pk_response(RegisterPkResponse {
-                        result: register_pk_response::Result::OK.into(),
-                        ..Default::default()
-                    });
-                    socket.send(&msg_out, addr).await?
                 }
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
                     // UDP PunchHoleRequest is intentionally unsupported.
@@ -459,6 +381,27 @@ impl RendezvousServer {
                 }
                 Some(rendezvous_message::Union::PunchHoleSent(phs)) => {
                     // UDP PunchHoleSent is intentionally unsupported to avoid UDP reflection/amplification
+                    // araponto: with PUNCH_UDP it is accepted only when it answers a pending UDP punch,
+                    // and the answer goes over the controller's TCP connection, never over UDP.
+                    if crate::araponto::punch_udp() {
+                        let addr_a = AddrMangle::decode(&phs.socket_addr);
+                        match crate::araponto::pending_take(addr_a, &phs.id, addr) {
+                            Ok(()) => self.handle_hole_sent_udp(phs, addr_a, addr).await,
+                            Err(stat) => crate::araponto::inc(stat),
+                        }
+                    }
+                }
+                Some(rendezvous_message::Union::TestNatRequest(_)) => {
+                    // araponto: the controller learns its UDP punch port from this answer. No
+                    // ConfigUpdate is attached, so the reply is no bigger than the request.
+                    if crate::araponto::punch_udp() && crate::araponto::test_nat_allow(addr) {
+                        let mut msg_out = RendezvousMessage::new();
+                        msg_out.set_test_nat_response(TestNatResponse {
+                            port: addr.port() as _,
+                            ..Default::default()
+                        });
+                        allow_err!(socket.send(&msg_out, addr).await);
+                    }
                 }
                 Some(rendezvous_message::Union::LocalAddr(la)) => {
                     // UDP LocalAddr is intentionally unsupported to avoid UDP reflection/amplification
@@ -500,6 +443,99 @@ impl RendezvousServer {
         Ok(())
     }
 
+    /// Validates and stores a RegisterPk. None = ignore silently (empty uuid/pk).
+    /// Shared by the UDP path and, in this fork, by WebSocket registration.
+    async fn register_pk_common(
+        &mut self,
+        rk: RegisterPk,
+        addr: SocketAddr,
+        ws: bool,
+    ) -> Option<register_pk_response::Result> {
+        if rk.uuid.is_empty() || rk.pk.is_empty() {
+            return None;
+        }
+        let id = rk.id;
+        let ip = addr.ip().to_string();
+        if id.len() < 6 {
+            return Some(UUID_MISMATCH);
+        } else if !ws && !self.check_ip_blocker(&ip, &id).await {
+            return Some(TOO_FREQUENT);
+        }
+        let peer = self.pm.get_or(&id).await;
+        let (changed, ip_changed) = {
+            let peer = peer.read().await;
+            if peer.uuid.is_empty() {
+                (true, false)
+            } else {
+                if peer.uuid == rk.uuid {
+                    if peer.info.ip != ip && peer.pk != rk.pk {
+                        log::warn!(
+                            "Peer {} ip/pk mismatch: {}/{:?} vs {}/{:?}",
+                            id,
+                            ip,
+                            rk.pk,
+                            peer.info.ip,
+                            peer.pk,
+                        );
+                        drop(peer);
+                        return Some(UUID_MISMATCH);
+                    }
+                } else {
+                    log::warn!(
+                        "Peer {} uuid mismatch: {:?} vs {:?}",
+                        id,
+                        rk.uuid,
+                        peer.uuid
+                    );
+                    drop(peer);
+                    return Some(UUID_MISMATCH);
+                }
+                let ip_changed = peer.info.ip != ip;
+                (
+                    peer.uuid != rk.uuid || peer.pk != rk.pk || ip_changed,
+                    ip_changed,
+                )
+            }
+        };
+        // araponto: a WebSocket peer re-registers on every reconnect; an identical key is not an
+        // attempt to squat an id, so only new or changed keys count against the IP blocker.
+        if ws && changed && !self.check_ip_blocker(&ip, &id).await {
+            return Some(TOO_FREQUENT);
+        }
+        let mut req_pk = peer.read().await.reg_pk;
+        if req_pk.1.elapsed().as_secs() > 6 {
+            req_pk.0 = 0;
+        } else if req_pk.0 > 2 {
+            return Some(TOO_FREQUENT);
+        }
+        req_pk.0 += 1;
+        req_pk.1 = Instant::now();
+        peer.write().await.reg_pk = req_pk;
+        if ip_changed {
+            let mut lock = IP_CHANGES.lock().await;
+            if let Some((tm, ips)) = lock.get_mut(&id) {
+                if tm.elapsed().as_secs() > IP_CHANGE_DUR {
+                    *tm = Instant::now();
+                    ips.clear();
+                    ips.insert(ip.clone(), 1);
+                } else if let Some(v) = ips.get_mut(&ip) {
+                    *v += 1;
+                } else {
+                    ips.insert(ip.clone(), 1);
+                }
+            } else {
+                lock.insert(
+                    id.clone(),
+                    (Instant::now(), HashMap::from([(ip.clone(), 1)])),
+                );
+            }
+        }
+        if changed {
+            self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
+        }
+        Some(register_pk_response::Result::OK)
+    }
+
     #[inline]
     async fn handle_tcp(
         &mut self,
@@ -525,11 +561,15 @@ impl RendezvousServer {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
+                        let id = rf.id.clone();
                         let mut msg_out = RendezvousMessage::new();
                         rf.socket_addr = AddrMangle::encode(addr).into();
                         msg_out.set_request_relay(rf);
-                        let peer_addr = peer.read().await.socket_addr;
-                        self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
+                        // araponto: a peer registered over WebSocket is reached on its own connection.
+                        if Self::send_to_ws_peer(&id, &msg_out).is_none() {
+                            let peer_addr = peer.read().await.socket_addr;
+                            self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
+                        }
                     }
                     return true;
                 }
@@ -655,6 +695,9 @@ impl RendezvousServer {
             relay_server: phs.relay_server.clone(),
             ..Default::default()
         };
+        if crate::araponto::punch_ipv6() {
+            p.socket_addr_v6 = crate::araponto::valid_v6(&phs.socket_addr_v6);
+        }
         if let Ok(t) = phs.nat_type.enum_value() {
             p.set_nat_type(t);
         }
@@ -689,6 +732,9 @@ impl RendezvousServer {
             relay_server: la.relay_server,
             ..Default::default()
         };
+        if crate::araponto::punch_ipv6() {
+            p.socket_addr_v6 = crate::araponto::valid_v6(&la.socket_addr_v6);
+        }
         p.set_is_local(true);
         msg_out.set_punch_hole_response(p);
         if let Some(socket) = socket {
@@ -697,6 +743,29 @@ impl RendezvousServer {
             self.send_to_tcp(msg_out, addr_a).await;
         }
         Ok(())
+    }
+
+    /// araponto: B answered a pending UDP punch from its new UDP socket `b_udp`. Tell A over its
+    /// waiting TCP connection that B is reachable there with `is_udp`, so A uses its UDP socket.
+    async fn handle_hole_sent_udp(&mut self, phs: PunchHoleSent, addr_a: SocketAddr, b_udp: SocketAddr) {
+        log::info!("punch: udp hole_sent accepted {} {} -> {}", phs.id, b_udp, addr_a);
+        crate::araponto::inc(crate::araponto::Stat::HoleSentUdpAccepted);
+        let mut msg_out = RendezvousMessage::new();
+        let mut p = PunchHoleResponse {
+            socket_addr: AddrMangle::encode(b_udp).into(),
+            pk: self.get_pk(&phs.version, phs.id).await,
+            relay_server: phs.relay_server.clone(),
+            is_udp: true,
+            ..Default::default()
+        };
+        if crate::araponto::punch_ipv6() {
+            p.socket_addr_v6 = crate::araponto::valid_v6(&phs.socket_addr_v6);
+        }
+        if let Ok(t) = phs.nat_type.enum_value() {
+            p.set_nat_type(t);
+        }
+        msg_out.set_punch_hole_response(p);
+        self.send_to_tcp(msg_out, addr_a).await;
     }
 
     #[inline]
@@ -751,6 +820,11 @@ impl RendezvousServer {
                     }
                 }
                 if !dup { lock.push(PunchReqEntry { tm: Instant::now(), from_ip, to_ip, to_id: to_id_clone }); }
+                // araponto: keep the history bounded; upstream only empties it from the console.
+                if lock.len() > 10_000 {
+                    let excess = lock.len() - 10_000;
+                    lock.drain(..excess);
+                }
             }
 
             let mut msg_out = RendezvousMessage::new();
@@ -772,6 +846,41 @@ impl RendezvousServer {
                         _ => false,
                     }
                 });
+            // araponto: UDP / IPv6 punching extras. With PUNCH_UDP=N and PUNCH_IPV6=N nothing below
+            // changes the upstream messages.
+            let extras_on = crate::araponto::punch_udp() || crate::araponto::punch_ipv6();
+            let force_relay =
+                extras_on && (ph.force_relay || ALWAYS_USE_RELAY.load(Ordering::SeqCst));
+            let (mut udp_port, socket_addr_v6) = crate::araponto::punch_extras(
+                ph.udp_port,
+                &ph.socket_addr_v6,
+                addr,
+                &id,
+                ws || force_relay || crate::araponto::ws_peer_exists(&id),
+            );
+            // B relays straight away for SYMMETRIC, so a UDP punch would never be answered.
+            if udp_port > 0
+                && (same_intranet
+                    || ph.nat_type.enum_value() == Ok(NatType::SYMMETRIC)
+                    || !crate::araponto::pending_insert(addr, &id, peer_addr.ip()))
+            {
+                udp_port = 0;
+            }
+            if udp_port > 0 || !socket_addr_v6.is_empty() {
+                log::info!(
+                    "punch: fwd udp_port={} v6={} {} -> {}",
+                    udp_port,
+                    !socket_addr_v6.is_empty(),
+                    addr,
+                    id
+                );
+                if udp_port > 0 {
+                    crate::araponto::inc(crate::araponto::Stat::PunchFwdUdp);
+                }
+                if !socket_addr_v6.is_empty() {
+                    crate::araponto::inc(crate::araponto::Stat::PunchFwdV6);
+                }
+            }
             let socket_addr = AddrMangle::encode(addr).into();
             if same_intranet {
                 log::debug!(
@@ -783,6 +892,7 @@ impl RendezvousServer {
                 msg_out.set_fetch_local_addr(FetchLocalAddr {
                     socket_addr,
                     relay_server,
+                    socket_addr_v6,
                     ..Default::default()
                 });
             } else {
@@ -796,6 +906,9 @@ impl RendezvousServer {
                     socket_addr,
                     nat_type: ph.nat_type,
                     relay_server,
+                    udp_port,
+                    force_relay,
+                    socket_addr_v6,
                     ..Default::default()
                 });
             }
@@ -882,13 +995,35 @@ impl RendezvousServer {
         key: &str,
         ws: bool,
     ) -> ResultType<()> {
+        let id = ph.id.clone();
         let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
-        if let Some(addr) = to_addr {
-            self.tx.send(Data::Msg(msg.into(), addr))?;
+        if let Some(peer_addr) = to_addr {
+            // araponto: a peer registered over WebSocket is reached on its own connection.
+            match Self::send_to_ws_peer(&id, &msg) {
+                None => self.tx.send(Data::Msg(msg.into(), peer_addr))?,
+                Some(true) => {}
+                Some(false) => {
+                    let mut msg_out = RendezvousMessage::new();
+                    msg_out.set_punch_hole_response(PunchHoleResponse {
+                        failure: punch_hole_response::Failure::OFFLINE.into(),
+                        ..Default::default()
+                    });
+                    self.send_to_tcp_sync(msg_out, addr).await?;
+                }
+            }
         } else {
             self.send_to_tcp_sync(msg, addr).await?;
         }
         Ok(())
+    }
+
+    /// araponto: None when `id` is not registered over WebSocket (send over UDP as usual).
+    fn send_to_ws_peer(id: &str, msg: &RendezvousMessage) -> Option<bool> {
+        if !crate::araponto::ws_register_enabled() {
+            return None;
+        }
+        let bytes = msg.write_to_bytes().ok()?;
+        crate::araponto::ws_peer_send(id, Bytes::from(bytes))
     }
 
     #[inline]
@@ -934,6 +1069,12 @@ impl RendezvousServer {
             }
             counter.1 = now;
         } else {
+            // araponto: bound the table; upstream only prunes it from the console.
+            if lock.len() >= 100_000 {
+                lock.retain(|_, (a, b)| {
+                    a.1.elapsed().as_secs() <= IP_BLOCK_DUR || b.1.elapsed().as_secs() <= DAY_SECONDS
+                });
+            }
             lock.insert(ip.to_owned(), ((0, now), (Default::default(), now)));
         }
         true
@@ -963,14 +1104,15 @@ impl RendezvousServer {
         match fds.next() {
             Some("h") => {
                 res = format!(
-                    "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+                    "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
                     "relay-servers(rs) <separated by ,>",
                     "reload-geo(rg)",
                     "ip-blocker(ib) [<ip>|<number>] [-]",
                     "ip-changes(ic) [<id>|<number>] [-]",
                     "punch-requests(pr) [<number>] [-]",
                     "always-use-relay(aur)",
-                    "test-geo(tg) <ip1> <ip2>"
+                    "test-geo(tg) <ip1> <ip2>",
+                    "araponto-stats(as) [-]"
                 )
             }
             Some("relay-servers" | "rs") => {
@@ -1102,6 +1244,9 @@ impl RendezvousServer {
                     );
                 }
             }
+            Some("araponto-stats" | "as") => {
+                res = crate::araponto::stats_text(fds.next() == Some("-"));
+            }
             Some("test-geo" | "tg") => {
                 if let Some(rs) = fds.next() {
                     if let Ok(a) = rs.parse::<IpAddr>() {
@@ -1195,13 +1340,9 @@ impl RendezvousServer {
                     .get("X-Real-IP")
                     .or_else(|| headers.get("X-Forwarded-For"))
                     .and_then(|header_value| header_value.to_str().ok());
-                if let Some(ip) = real_ip {
-                    if ip.contains('.') {
-                        addr = format!("{ip}:0").parse().unwrap_or(addr);
-                    } else {
-                        addr = format!("[{ip}]:0").parse().unwrap_or(addr);
-                    }
-                }
+                // araponto: trust the header only from our reverse proxy on loopback, and keep the
+                // proxy-side port so two clients behind one NAT never share an address.
+                addr = crate::common::ws_client_addr(addr, real_ip);
                 Ok(response)
             };
             let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
@@ -1209,6 +1350,19 @@ impl RendezvousServer {
             sink = Some(Sink::Ws(a));
             while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
                 if let tungstenite::Message::Binary(bytes) = msg {
+                    // araponto: RegisterPk over WebSocket turns this connection into the peer's route.
+                    if crate::araponto::ws_register_enabled() {
+                        if let Ok(RendezvousMessage {
+                            union: Some(rendezvous_message::Union::RegisterPk(rk)),
+                            ..
+                        }) = RendezvousMessage::parse_from_bytes(&bytes)
+                        {
+                            if let Some(Sink::Ws(ws_sink)) = sink.take() {
+                                self.serve_ws_peer(rk, addr, ws_sink, b).await;
+                                return Ok(());
+                            }
+                        }
+                    }
                     if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
                         break;
                     }
@@ -1228,6 +1382,123 @@ impl RendezvousServer {
         }
         log::debug!("Tcp connection from {:?} closed", addr);
         Ok(())
+    }
+
+    /// araponto: a client that cannot use UDP registers over WebSocket and stays on this
+    /// connection. hbbs sends an empty Binary frame every 15 s, which the 1.4.9 client echoes;
+    /// a Ping would not do, the client drops Ping frames and gives up after keep_alive x 1.5.
+    async fn serve_ws_peer(
+        &mut self,
+        rk: RegisterPk,
+        addr: SocketAddr,
+        mut sink: WsSink,
+        mut stream: WsStream,
+    ) {
+        use crate::araponto::{inc, Stat};
+        const HEARTBEAT: Duration = Duration::from_secs(15);
+        const READ_TIMEOUT: Duration = Duration::from_secs(45);
+        // the client drops the connection after keep_alive * 1.5 without a message
+        const KEEP_ALIVE_SECS: i32 = 30;
+
+        let id = rk.id.clone();
+        let res = match self.register_pk_common(rk, addr, true).await {
+            Some(res) => res,
+            None => return,
+        };
+        let ok = res == register_pk_response::Result::OK;
+        let mut msg_out = RendezvousMessage::new();
+        msg_out.set_register_pk_response(RegisterPkResponse {
+            result: res.into(),
+            keep_alive: if ok { KEEP_ALIVE_SECS } else { 0 },
+            ..Default::default()
+        });
+        if let Ok(bytes) = msg_out.write_to_bytes() {
+            if sink.send(tungstenite::Message::Binary(bytes)).await.is_err() {
+                return;
+            }
+        }
+        if !ok {
+            inc(Stat::WsRegisterRejected);
+            log::info!("WS register {} from {} rejected: {:?}", id, addr, res);
+            return;
+        }
+        self.touch_ws_peer(&id, addr).await;
+        let (tx, mut rx) = mpsc::unbounded_channel::<Bytes>();
+        let conn_id = crate::araponto::ws_peer_add(&id, tx);
+        inc(Stat::WsRegister);
+        log::info!("WS register {} from {}", id, addr);
+
+        let mut heartbeat = interval(HEARTBEAT);
+        heartbeat.tick().await;
+        let mut last_recv = Instant::now();
+        let reason = loop {
+            tokio::select! {
+                _ = heartbeat.tick() => {
+                    if last_recv.elapsed() > READ_TIMEOUT {
+                        break "timeout";
+                    }
+                    if sink.send(tungstenite::Message::Binary(Vec::new())).await.is_err() {
+                        break "send failed";
+                    }
+                }
+                Some(bytes) = rx.recv() => {
+                    if sink.send(tungstenite::Message::Binary(bytes.to_vec())).await.is_err() {
+                        break "send failed";
+                    }
+                }
+                msg = stream.next() => match msg {
+                    Some(Ok(tungstenite::Message::Binary(bytes))) => {
+                        last_recv = Instant::now();
+                        self.touch_ws_peer(&id, addr).await;
+                        if let Ok(RendezvousMessage {
+                            union: Some(rendezvous_message::Union::RegisterPk(rk)),
+                            ..
+                        }) = RendezvousMessage::parse_from_bytes(&bytes)
+                        {
+                            if rk.id != id {
+                                break "id changed";
+                            }
+                            let res = self
+                                .register_pk_common(rk, addr, true)
+                                .await
+                                .unwrap_or(register_pk_response::Result::OK);
+                            let mut msg_out = RendezvousMessage::new();
+                            msg_out.set_register_pk_response(RegisterPkResponse {
+                                result: res.into(),
+                                keep_alive: KEEP_ALIVE_SECS,
+                                ..Default::default()
+                            });
+                            if let Ok(bytes) = msg_out.write_to_bytes() {
+                                if sink.send(tungstenite::Message::Binary(bytes)).await.is_err() {
+                                    break "send failed";
+                                }
+                            }
+                        }
+                    }
+                    Some(Ok(tungstenite::Message::Close(_))) | None => break "closed",
+                    Some(Err(_)) => break "read error",
+                    Some(Ok(_)) => {
+                        last_recv = Instant::now();
+                    }
+                }
+            }
+        };
+        if crate::araponto::ws_peer_remove(&id, conn_id) {
+            // offline right away instead of after REG_TIMEOUT
+            if let Some(peer) = self.pm.get_in_memory(&id).await {
+                peer.write().await.last_reg_time = get_expired_time();
+            }
+            inc(Stat::WsOffline);
+            log::info!("WS peer {} offline ({})", id, reason);
+        }
+    }
+
+    async fn touch_ws_peer(&self, id: &str, addr: SocketAddr) {
+        if let Some(peer) = self.pm.get_in_memory(id).await {
+            let mut w = peer.write().await;
+            w.socket_addr = addr;
+            w.last_reg_time = Instant::now();
+        }
     }
 
     #[inline]
