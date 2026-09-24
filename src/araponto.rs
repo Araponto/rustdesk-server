@@ -54,6 +54,7 @@ pub fn ws_register_enabled() -> bool {
 
 /// Reads the switches and starts the background tasks. Must run inside the tokio runtime.
 pub fn init(pm: PeerMap) {
+    Lazy::force(&STARTED);
     let on = |name: &str| get_arg(name).to_uppercase() == "Y";
     PUNCH_UDP.store(on("PUNCH_UDP"), Ordering::SeqCst);
     PUNCH_IPV6.store(on("PUNCH_IPV6"), Ordering::SeqCst);
@@ -94,6 +95,7 @@ pub enum Stat {
     HoleSentUdpAccepted,
     HoleSentUdpNoPending,
     HoleSentUdpMismatch,
+    HoleSentUdpDuplicate,
     WsRegister,
     WsRegisterRejected,
     WsOffline,
@@ -103,7 +105,7 @@ pub enum Stat {
     ApiFallbackPushed,
 }
 
-const STAT_NAMES: [&str; 16] = [
+const STAT_NAMES: [&str; N_STATS] = [
     "test_nat_udp",
     "test_nat_udp_limited",
     "punch_fwd_udp",
@@ -113,6 +115,7 @@ const STAT_NAMES: [&str; 16] = [
     "hole_sent_udp_accepted",
     "hole_sent_udp_no_pending",
     "hole_sent_udp_mismatch",
+    "hole_sent_udp_duplicate",
     "ws_register",
     "ws_register_rejected",
     "ws_offline",
@@ -122,32 +125,18 @@ const STAT_NAMES: [&str; 16] = [
     "api_fallback_pushed",
 ];
 
-static COUNTERS: [AtomicU64; 16] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
+const N_STATS: usize = 17;
+#[allow(clippy::declare_interior_mutable_const)]
+const ZERO: AtomicU64 = AtomicU64::new(0);
+static COUNTERS: [AtomicU64; N_STATS] = [ZERO; N_STATS];
 
 #[inline]
 pub fn inc(s: Stat) {
     COUNTERS[s as usize].fetch_add(1, Ordering::Relaxed);
 }
 
-fn snapshot() -> [u64; 16] {
-    let mut out = [0u64; 16];
+fn snapshot() -> [u64; N_STATS] {
+    let mut out = [0u64; N_STATS];
     for (i, c) in COUNTERS.iter().enumerate() {
         out[i] = c.load(Ordering::Relaxed);
     }
@@ -165,7 +154,7 @@ pub fn stats_text(reset: bool) -> String {
         "pending_udp_punch: {}\nws_peers: {}\nheartbeat_ids: {}\n",
         PENDING.lock().map(|m| m.len()).unwrap_or(0),
         WS_PEERS.lock().map(|m| m.len()).unwrap_or(0),
-        HB_FIRST_SEEN.lock().map(|m| m.len()).unwrap_or(0),
+        HB_FIRST_SEEN.lock().map(|g| g.0.len()).unwrap_or(0),
     ));
     if reset {
         for c in COUNTERS.iter() {
@@ -198,7 +187,7 @@ async fn stats_logger() {
 // Rate limiting (fixed window, bounded memory)
 
 pub struct RateLimiter<K> {
-    map: Mutex<HashMap<K, (u32, Instant)>>,
+    map: Mutex<(HashMap<K, (u32, Instant)>, Instant)>,
     max: u32,
     window: Duration,
     cap: usize,
@@ -207,7 +196,7 @@ pub struct RateLimiter<K> {
 impl<K: Eq + Hash + Clone> RateLimiter<K> {
     pub fn new(max: u32, window: Duration, cap: usize) -> Self {
         Self {
-            map: Mutex::new(HashMap::new()),
+            map: Mutex::new((HashMap::new(), Instant::now())),
             max,
             window,
             cap,
@@ -215,15 +204,18 @@ impl<K: Eq + Hash + Clone> RateLimiter<K> {
     }
 
     /// True if one more event for `key` fits in the current window.
-    /// When the map is full of live keys, new keys are refused (fail closed).
+    /// A full table is swept at most once per window, so a flood of new keys cannot turn every
+    /// call into a full scan; while it stays full, new keys are refused (fail closed).
     pub fn allow(&self, key: &K) -> bool {
-        let Ok(mut m) = self.map.lock() else {
+        let Ok(mut guard) = self.map.lock() else {
             return false;
         };
+        let (m, last_sweep) = &mut *guard;
         let now = Instant::now();
-        if m.len() >= self.cap {
+        if m.len() >= self.cap && now.duration_since(*last_sweep) >= self.window {
             let window = self.window;
             m.retain(|_, v| now.duration_since(v.1) < window);
+            *last_sweep = now;
         }
         match m.get_mut(key) {
             Some(v) if now.duration_since(v.1) < self.window => {
@@ -259,9 +251,10 @@ static PUNCH_EXTRA: Lazy<RateLimiter<(IpAddr, String)>> =
     Lazy::new(|| RateLimiter::new(8, Duration::from_secs(30), 50_000));
 
 /// Whether a UDP TestNatRequest from `addr` may be answered.
+/// The global cap is checked first, so a spoofed flood stops before touching the per-IP table.
 pub fn test_nat_allow(addr: SocketAddr) -> bool {
     let ip = try_into_v4(addr).ip();
-    if TEST_NAT_PER_IP.allow(&ip) && TEST_NAT_GLOBAL.allow(&()) {
+    if TEST_NAT_GLOBAL.allow(&()) && TEST_NAT_PER_IP.allow(&ip) {
         inc(Stat::TestNatUdp);
         true
     } else {
@@ -327,6 +320,7 @@ struct PendingUdpPunch {
     to_id: String,
     b_ip: IpAddr,
     tm: Instant,
+    consumed: bool,
 }
 
 // The controller waits 3 + 6 + 9 s at most for the answer.
@@ -354,6 +348,7 @@ pub fn pending_insert(a: SocketAddr, to_id: &str, b_ip: IpAddr) -> bool {
             to_id: to_id.to_owned(),
             b_ip: try_into_v4(SocketAddr::new(b_ip, 0)).ip(),
             tm: now,
+            consumed: false,
         },
     );
     true
@@ -361,27 +356,27 @@ pub fn pending_insert(a: SocketAddr, to_id: &str, b_ip: IpAddr) -> bool {
 
 /// Consumes the pending punch that a UDP PunchHoleSent from `b_src` answers.
 /// A packet that does not match (wrong peer id or source IP) leaves the entry in place, so a
-/// forged packet cannot cancel the real punch.
+/// forged packet cannot cancel the real punch. B sends three copies; the entry stays as consumed
+/// until it expires, so the other two count as duplicates, not as unknown.
 pub fn pending_take(a: SocketAddr, id: &str, b_src: SocketAddr) -> Result<(), Stat> {
     let key = try_into_v4(a);
     let Ok(mut m) = PENDING.lock() else {
         return Err(Stat::HoleSentUdpNoPending);
     };
-    let (expired, matches) = match m.get(&key) {
-        None => return Err(Stat::HoleSentUdpNoPending),
-        Some(p) => (
-            p.tm.elapsed() >= PENDING_TTL,
-            p.to_id == id && p.b_ip == try_into_v4(b_src).ip(),
-        ),
+    let Some(p) = m.get_mut(&key) else {
+        return Err(Stat::HoleSentUdpNoPending);
     };
-    if expired {
+    if p.tm.elapsed() >= PENDING_TTL {
         m.remove(&key);
         return Err(Stat::HoleSentUdpNoPending);
     }
-    if !matches {
+    if p.to_id != id || p.b_ip != try_into_v4(b_src).ip() {
         return Err(Stat::HoleSentUdpMismatch);
     }
-    m.remove(&key);
+    if p.consumed {
+        return Err(Stat::HoleSentUdpDuplicate);
+    }
+    p.consumed = true;
     Ok(())
 }
 
@@ -440,28 +435,75 @@ pub fn ws_peer_send(id: &str, bytes: Bytes) -> Option<bool> {
 // ---------------------------------------------------------------------------------------------
 // Heartbeat API: tells a client with no UDP registration to use WebSocket
 
-// Decide on the second heartbeat (~18 s after start): UDP registration normally lands in < 1 s.
-const FALLBACK_AFTER: Duration = Duration::from_secs(10);
+// A client with working UDP reaches hbbs within ~15 s of starting (RegisterPeer every ~12 s).
+// Decide on the third heartbeat (~33 s after the client starts).
+const FALLBACK_AFTER: Duration = Duration::from_secs(30);
+// After hbbs starts, give every client a full registration cycle before judging it.
+const STARTUP_GRACE: Duration = Duration::from_secs(60);
+const UDP_SEEN_TTL: Duration = Duration::from_secs(120);
+const UDP_SEEN_CAP: usize = 200_000;
+
+static STARTED: Lazy<Instant> = Lazy::new(Instant::now);
+
+// Last time any UDP registration packet (RegisterPeer / RegisterPk) arrived for an id. A client
+// whose UDP is blocked never shows up here, whatever state hbbs was restarted in.
+static UDP_SEEN: Lazy<Mutex<(HashMap<String, Instant>, Instant)>> =
+    Lazy::new(|| Mutex::new((HashMap::new(), Instant::now())));
+
+/// Called from the UDP loop for every RegisterPeer / RegisterPk with a non-empty id.
+pub fn udp_seen(id: &str) {
+    if id.is_empty() || id.len() > 64 {
+        return;
+    }
+    let Ok(mut guard) = UDP_SEEN.lock() else {
+        return;
+    };
+    let (m, last_sweep) = &mut *guard;
+    let now = Instant::now();
+    if let Some(t) = m.get_mut(id) {
+        *t = now;
+        return;
+    }
+    if m.len() >= UDP_SEEN_CAP && now.duration_since(*last_sweep) >= UDP_SEEN_TTL {
+        m.retain(|_, t| now.duration_since(*t) < UDP_SEEN_TTL);
+        *last_sweep = now;
+    }
+    if m.len() < UDP_SEEN_CAP {
+        m.insert(id.to_owned(), now);
+    }
+}
+
+fn udp_seen_recently(id: &str) -> bool {
+    UDP_SEEN
+        .lock()
+        .ok()
+        .and_then(|g| g.0.get(id).map(|t| t.elapsed() < UDP_SEEN_TTL))
+        .unwrap_or(false)
+}
 const HB_TTL: Duration = Duration::from_secs(600);
 const HB_CAP: usize = 100_000;
 
-static HB_FIRST_SEEN: Lazy<Mutex<HashMap<String, Instant>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static HB_FIRST_SEEN: Lazy<Mutex<(HashMap<String, Instant>, Instant)>> =
+    Lazy::new(|| Mutex::new((HashMap::new(), Instant::now())));
 
 fn hb_forget(id: &str) {
-    if let Ok(mut m) = HB_FIRST_SEEN.lock() {
-        m.remove(id);
+    if let Ok(mut g) = HB_FIRST_SEEN.lock() {
+        g.0.remove(id);
     }
 }
 
 /// How long `id` has been sending heartbeats without a UDP registration.
 fn hb_age(id: &str) -> Duration {
-    let Ok(mut m) = HB_FIRST_SEEN.lock() else {
+    let Ok(mut guard) = HB_FIRST_SEEN.lock() else {
         return Duration::ZERO;
     };
+    let (m, last_sweep) = &mut *guard;
     let now = Instant::now();
-    if m.len() >= HB_CAP {
-        m.retain(|_, t| now.duration_since(*t) < HB_TTL);
+    if m.len() >= HB_CAP && !m.contains_key(id) {
+        if now.duration_since(*last_sweep) >= Duration::from_secs(60) {
+            m.retain(|_, t| now.duration_since(*t) < HB_TTL);
+            *last_sweep = now;
+        }
         if m.len() >= HB_CAP {
             return Duration::ZERO;
         }
@@ -520,7 +562,11 @@ mod api {
     }
 
     async fn should_use_ws(pm: &PeerMap, id: &str) -> bool {
-        if ws_peer_exists(id) {
+        // Telling a client to use WebSocket when hbbs cannot register it there would take it offline.
+        if !ws_register_enabled() || STARTED.elapsed() < STARTUP_GRACE {
+            return false;
+        }
+        if ws_peer_exists(id) || udp_seen_recently(id) {
             hb_forget(id);
             return false;
         }
@@ -603,10 +649,10 @@ mod tests {
         ));
         // v4 and v4-mapped forms of A are the same key
         assert!(pending_take("10.0.0.1:40000".parse().unwrap(), "123456789", b_src).is_ok());
-        // consumed: the copies B sends afterwards find nothing
+        // consumed: the copies B sends afterwards are duplicates
         assert!(matches!(
             pending_take(a, "123456789", b_src),
-            Err(Stat::HoleSentUdpNoPending)
+            Err(Stat::HoleSentUdpDuplicate)
         ));
     }
 

@@ -358,6 +358,7 @@ impl RendezvousServer {
                     // B registered
                     if !rp.id.is_empty() {
                         log::trace!("New peer registered: {:?} {:?}", &rp.id, &addr);
+                        crate::araponto::udp_seen(&rp.id);
                         self.update_addr(rp.id, addr, socket).await?;
                         if self.inner.serial > rp.serial {
                             let mut msg_out = RendezvousMessage::new();
@@ -371,6 +372,7 @@ impl RendezvousServer {
                     }
                 }
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
+                    crate::araponto::udp_seen(&rk.id);
                     if let Some(res) = self.register_pk_common(rk, addr, false).await {
                         return send_rk_res(socket, addr, res).await;
                     }
@@ -386,7 +388,13 @@ impl RendezvousServer {
                     if crate::araponto::punch_udp() {
                         let addr_a = AddrMangle::decode(&phs.socket_addr);
                         match crate::araponto::pending_take(addr_a, &phs.id, addr) {
-                            Ok(()) => self.handle_hole_sent_udp(phs, addr_a, addr).await,
+                            Ok(()) => {
+                                // get_pk may hit the database: keep it off the UDP loop
+                                let mut rs = self.clone();
+                                tokio::spawn(async move {
+                                    rs.handle_hole_sent_udp(phs, addr_a, addr).await;
+                                });
+                            }
                             Err(stat) => crate::araponto::inc(stat),
                         }
                     }
@@ -1069,12 +1077,6 @@ impl RendezvousServer {
             }
             counter.1 = now;
         } else {
-            // araponto: bound the table; upstream only prunes it from the console.
-            if lock.len() >= 100_000 {
-                lock.retain(|_, (a, b)| {
-                    a.1.elapsed().as_secs() <= IP_BLOCK_DUR || b.1.elapsed().as_secs() <= DAY_SECONDS
-                });
-            }
             lock.insert(ip.to_owned(), ((0, now), (Default::default(), now)));
         }
         true
@@ -1399,6 +1401,13 @@ impl RendezvousServer {
         const READ_TIMEOUT: Duration = Duration::from_secs(45);
         // the client drops the connection after keep_alive * 1.5 without a message
         const KEEP_ALIVE_SECS: i32 = 30;
+        const SEND_TIMEOUT_MS: u64 = 10_000;
+        async fn send(sink: &mut WsSink, bytes: Vec<u8>) -> bool {
+            matches!(
+                timeout(SEND_TIMEOUT_MS, sink.send(tungstenite::Message::Binary(bytes))).await,
+                Ok(Ok(()))
+            )
+        }
 
         let id = rk.id.clone();
         let res = match self.register_pk_common(rk, addr, true).await {
@@ -1413,7 +1422,7 @@ impl RendezvousServer {
             ..Default::default()
         });
         if let Ok(bytes) = msg_out.write_to_bytes() {
-            if sink.send(tungstenite::Message::Binary(bytes)).await.is_err() {
+            if !send(&mut sink, bytes).await {
                 return;
             }
         }
@@ -1437,14 +1446,18 @@ impl RendezvousServer {
                     if last_recv.elapsed() > READ_TIMEOUT {
                         break "timeout";
                     }
-                    if sink.send(tungstenite::Message::Binary(Vec::new())).await.is_err() {
+                    if !send(&mut sink, Vec::new()).await {
                         break "send failed";
                     }
                 }
-                Some(bytes) = rx.recv() => {
-                    if sink.send(tungstenite::Message::Binary(bytes.to_vec())).await.is_err() {
-                        break "send failed";
+                bytes = rx.recv() => match bytes {
+                    Some(bytes) => {
+                        if !send(&mut sink, bytes.to_vec()).await {
+                            break "send failed";
+                        }
                     }
+                    // a newer connection registered the same id and took the route
+                    None => break "replaced",
                 }
                 msg = stream.next() => match msg {
                     Some(Ok(tungstenite::Message::Binary(bytes))) => {
@@ -1469,7 +1482,7 @@ impl RendezvousServer {
                                 ..Default::default()
                             });
                             if let Ok(bytes) = msg_out.write_to_bytes() {
-                                if sink.send(tungstenite::Message::Binary(bytes)).await.is_err() {
+                                if !send(&mut sink, bytes).await {
                                     break "send failed";
                                 }
                             }
@@ -1484,9 +1497,13 @@ impl RendezvousServer {
             }
         };
         if crate::araponto::ws_peer_remove(&id, conn_id) {
-            // offline right away instead of after REG_TIMEOUT
+            // offline right away instead of after REG_TIMEOUT, unless a new connection for the
+            // same id registered in the meantime
             if let Some(peer) = self.pm.get_in_memory(&id).await {
-                peer.write().await.last_reg_time = get_expired_time();
+                let mut w = peer.write().await;
+                if !crate::araponto::ws_peer_exists(&id) {
+                    w.last_reg_time = get_expired_time();
+                }
             }
             inc(Stat::WsOffline);
             log::info!("WS peer {} offline ({})", id, reason);
