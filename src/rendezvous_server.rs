@@ -1450,14 +1450,16 @@ impl RendezvousServer {
                         break "send failed";
                     }
                 }
-                bytes = rx.recv() => match bytes {
-                    Some(bytes) => {
-                        if !send(&mut sink, bytes.to_vec()).await {
-                            break "send failed";
+                bytes = rx.recv() => {
+                    match bytes {
+                        Some(bytes) => {
+                            if !send(&mut sink, bytes.to_vec()).await {
+                                break "send failed";
+                            }
                         }
+                        // a newer connection registered the same id and took the route
+                        None => break "replaced",
                     }
-                    // a newer connection registered the same id and took the route
-                    None => break "replaced",
                 }
                 msg = stream.next() => match msg {
                     Some(Ok(tungstenite::Message::Binary(bytes))) => {
